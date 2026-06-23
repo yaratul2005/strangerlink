@@ -157,6 +157,42 @@ bun run build
 bun run start    # pm2 start ecosystem.config.cjs
 ```
 
+### ⚠️ Production checklist
+
+See [`PRODUCTION_AUDIT.md`](./PRODUCTION_AUDIT.md) for the full readiness review. Before a public launch:
+
+**1. TURN server (required for reliable video).** Without TURN, ~10–20% of users behind strict NATs/firewalls cannot establish a video connection. Provision coturn or a provider (Twilio / Cloudflare / Metered) and set:
+
+```bash
+VITE_TURN_URL=turn:turn.yourdomain.com:3478
+VITE_TURN_USERNAME=...
+VITE_TURN_CREDENTIAL=...
+```
+
+**2. TLS + same-origin WebSocket.** Camera/mic (`getUserMedia`) require HTTPS. Serve the app over TLS and reverse-proxy the signal server under the **same origin** at `/signal` — the frontend auto-resolves to `wss://<host>/signal` in production. Example (Caddy):
+
+```caddyfile
+strangerlink.app {
+    reverse_proxy /signal*  localhost:4201
+    reverse_proxy /api/*     localhost:4200
+    reverse_proxy /*         localhost:4200
+}
+```
+
+(Or set `VITE_SIGNAL_URL` explicitly if the signal server lives elsewhere.)
+
+**3. Lock down origins & moderation.** Set these in prod (see [`.env.example`](./.env.example)):
+
+| Var | Purpose |
+|-----|---------|
+| `ALLOWED_ORIGINS` | CORS allowlist for the REST API |
+| `SIGNAL_ALLOWED_ORIGINS` | WebSocket origin allowlist (rejects cross-site sockets) |
+| `ADMIN_TOKEN` | Bearer token for `GET /api/reports`; endpoint is **404 / disabled** if unset |
+
+Built-in abuse protection: per-IP connection cap (`SIGNAL_MAX_CONNS_PER_IP`), global peer ceiling (`SIGNAL_MAX_PEERS`), per-peer message rate limiting, and `POST /api/report` rate limiting (5/min/IP).
+
+**4. Still open** (documented in the audit): horizontal scaling needs Redis-backed shared state (currently single-process, in-memory), real age verification, content moderation, legal docs (ToS / privacy policy), and observability.
+
 ---
 
 ## License

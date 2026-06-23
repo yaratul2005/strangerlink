@@ -18,6 +18,7 @@ type Mode = "video" | "text";
 interface Peer {
   id: string;
   ws: import("bun").ServerWebSocket<WsData>;
+  ip: string;
   mode: Mode;
   interests: string[];
   language: string;
@@ -25,10 +26,12 @@ interface Peer {
   joinedAt: number;
   queuedAt: number;
   skipTimestamps: number[];
+  msgTimestamps: number[];
 }
 
 interface WsData {
   id: string;
+  ip: string;
 }
 
 const peers = new Map<string, Peer>();
@@ -41,6 +44,25 @@ const MAX_INTERESTS = 10;
 const SKIP_LIMIT = 10; // per window
 const SKIP_WINDOW_MS = 60_000;
 const SKIP_COOLDOWN_MS = 30_000;
+
+// --- Abuse / DoS protection ---------------------------------------------
+const MAX_PEERS = Number(process.env.SIGNAL_MAX_PEERS ?? 5000); // hard ceiling
+const MAX_CONNS_PER_IP = Number(process.env.SIGNAL_MAX_CONNS_PER_IP ?? 20);
+const MSG_RATE_LIMIT = 30; // messages per window per peer
+const MSG_RATE_WINDOW_MS = 10_000;
+// Comma-separated allowlist of origins. Empty = allow all (dev). Set in prod.
+const ALLOWED_ORIGINS = (process.env.SIGNAL_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const connsPerIp = new Map<string, number>(); // ip -> open socket count
+
+function originAllowed(origin: string | null): boolean {
+  if (ALLOWED_ORIGINS.length === 0) return true; // not configured => allow (dev)
+  if (!origin) return false;
+  return ALLOWED_ORIGINS.includes(origin);
+}
 
 const cooldowns = new Map<string, number>(); // peerId -> until ts
 
@@ -178,17 +200,37 @@ const server = Bun.serve<WsData>({
       );
     }
     if (url.pathname === "/signal") {
+      // Origin allowlist (prevents cross-site socket abuse in prod)
+      const origin = req.headers.get("origin");
+      if (!originAllowed(origin)) {
+        return new Response("forbidden origin", { status: 403 });
+      }
+      // Per-IP connection cap + global peer ceiling
+      const ip =
+        req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+        req.headers.get("x-real-ip") ||
+        srv.requestIP(req)?.address ||
+        "unknown";
+      if (peers.size >= MAX_PEERS) {
+        return new Response("server at capacity", { status: 503 });
+      }
+      if ((connsPerIp.get(ip) ?? 0) >= MAX_CONNS_PER_IP) {
+        return new Response("too many connections", { status: 429 });
+      }
       const id = uuid();
-      if (srv.upgrade(req, { data: { id } })) return;
+      if (srv.upgrade(req, { data: { id, ip } })) return;
       return new Response("upgrade failed", { status: 400 });
     }
     return new Response("StrangerLink signaling server", { status: 200 });
   },
   websocket: {
     open(ws) {
+      const ip = ws.data.ip;
+      connsPerIp.set(ip, (connsPerIp.get(ip) ?? 0) + 1);
       const peer: Peer = {
         id: ws.data.id,
         ws,
+        ip,
         mode: "text",
         interests: [],
         language: "en",
@@ -196,6 +238,7 @@ const server = Bun.serve<WsData>({
         joinedAt: Date.now(),
         queuedAt: 0,
         skipTimestamps: [],
+        msgTimestamps: [],
       };
       peers.set(peer.id, peer);
       send(peer, "connected", { id: peer.id, online: peers.size });
@@ -203,6 +246,15 @@ const server = Bun.serve<WsData>({
     message(ws, raw) {
       const peer = peers.get(ws.data.id);
       if (!peer) return;
+      // Per-peer message rate limit (anti-flood / DoS)
+      const now = Date.now();
+      peer.msgTimestamps = peer.msgTimestamps.filter((t) => now - t < MSG_RATE_WINDOW_MS);
+      peer.msgTimestamps.push(now);
+      if (peer.msgTimestamps.length > MSG_RATE_LIMIT) {
+        return; // silently drop excess traffic
+      }
+      // Cap raw frame size before parsing (defensive)
+      if (typeof raw === "string" && raw.length > 8192) return;
       let msg: { type: string; payload?: any };
       try {
         msg = JSON.parse(String(raw));
@@ -284,6 +336,10 @@ const server = Bun.serve<WsData>({
       }
     },
     close(ws) {
+      const ip = ws.data.ip;
+      const n = (connsPerIp.get(ip) ?? 1) - 1;
+      if (n <= 0) connsPerIp.delete(ip);
+      else connsPerIp.set(ip, n);
       const peer = peers.get(ws.data.id);
       if (!peer) return;
       removeFromQueue(peer.id);
@@ -294,3 +350,25 @@ const server = Bun.serve<WsData>({
 });
 
 console.log(`[signal] StrangerLink signaling server on ws://localhost:${server.port}/signal`);
+
+// Graceful shutdown: tell connected peers before the process exits so clients
+// can show a "reconnecting" state instead of a silent drop.
+function shutdown(sig: string) {
+  console.log(`[signal] received ${sig}, notifying ${peers.size} peers and shutting down`);
+  for (const peer of peers.values()) {
+    send(peer, "server_shutdown", { reason: "restart" });
+    try {
+      peer.ws.close();
+    } catch {
+      /* already closed */
+    }
+  }
+  try {
+    server.stop();
+  } catch {
+    /* noop */
+  }
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

@@ -11,6 +11,7 @@ export function useSignal() {
   const wsRef = useRef<WebSocket | null>(null);
   const handlers = useRef<Map<string, Set<Handler>>>(new Map());
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryCount = useRef(0);
   const mounted = useRef(true);
 
   const [connected, setConnected] = useState(false);
@@ -29,6 +30,7 @@ export function useSignal() {
 
     ws.onopen = () => {
       if (!mounted.current) return;
+      retryCount.current = 0; // reset backoff on a successful connect
       setConnected(true);
       setReconnecting(false);
     };
@@ -46,7 +48,11 @@ export function useSignal() {
       if (!mounted.current) return;
       setConnected(false);
       setReconnecting(true);
-      reconnectTimer.current = setTimeout(connect, 1500);
+      // Exponential backoff with jitter: 1s, 2s, 4s ... capped at 15s.
+      const attempt = retryCount.current++;
+      const base = Math.min(1000 * 2 ** attempt, 15_000);
+      const delay = base + Math.random() * 500;
+      reconnectTimer.current = setTimeout(connect, delay);
     };
     ws.onerror = () => {
       ws.close();
