@@ -161,4 +161,4 @@ bun run start    # pm2 start ecosystem.config.cjs
 
 ## License
 
-Private project. All rights reserved.
+[MIT](./LICENSE) © 2026 Yasser Ahmed
