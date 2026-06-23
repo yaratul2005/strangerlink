@@ -33,5 +33,7 @@ jobs:
       - name: Build
         run: bun run build
         env:
-          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          # Falls back to a harmless placeholder when repo secrets aren't set.
+          # The build only bundles the app — it doesn't connect to the DB.
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL || 'libsql://placeholder.turso.io' }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN || 'placeholder' }}
